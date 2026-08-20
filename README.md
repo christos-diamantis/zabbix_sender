@@ -12,6 +12,7 @@ Supports modern Zabbix 7.0+ proxy group redirect and multi-host high availabilit
 - Host autoregistration
 - Primary host caching (remembers working proxy)
 - Configurable timeouts & redirect limits
+- Goroutine-safe: one sender, unlimited concurrent sends
 
 ## 📦 Installation
 ```bash
@@ -144,7 +145,12 @@ if err == nil {
 sender := zabbix_sender.NewSenderHosts(hosts)
 sender.MaxRedirects = 10      // handle complex proxy groups
 sender.UpdateHost = true      // permanently cache final proxy
-sender.PrimaryHost = "known-good-proxy:10051" // pre-set cached host
+sender.SetPrimaryHost("known-good-proxy:10051") // pre-set cached host
+```
+
+A `Sender` is safe for concurrent use: call `SendMetrics`/`Send` from as many goroutines as you like. Set the configuration fields (`Hosts`, `MaxRedirects`, timeouts, ...) before sharing the sender between goroutines.
+```go
+cached := sender.PrimaryHost() // read the cached working host
 ```
 
 ## 🛠️ Compatibility
