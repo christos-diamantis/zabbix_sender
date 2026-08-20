@@ -3,6 +3,7 @@ package zabbix_sender
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,20 @@ type Sender struct {
 	// MaxResponseSize caps the response body length the sender accepts.
 	// 0 means DefaultMaxResponseSize.
 	MaxResponseSize uint64
+
+	// TLSConfig enables certificate-based TLS (Zabbix TLSConnect=cert)
+	// when non-nil. Ignored when DialFunc is set.
+	TLSConfig *tls.Config
+
+	// SourceIP optionally binds outgoing connections to a local address
+	// (Zabbix SourceIP). Ignored when DialFunc is set.
+	SourceIP string
+
+	// DialFunc, when non-nil, replaces the built-in dialer entirely and
+	// its net.Conn is used as the packet transport. This is the hook for
+	// TLS-PSK (not supported by crypto/tls) or any custom transport; the
+	// implementation should honor ctx and ConnectTimeout itself.
+	DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu          sync.RWMutex
 	primaryHost string // cached working host (empty = try Hosts in order)
@@ -213,11 +228,33 @@ func (s *Sender) sendWithRedirects(ctx context.Context, packet *Packet, startHos
 	return res, currentHost, fmt.Errorf("max redirects exceeded from %s", startHost)
 }
 
+// dial opens the transport connection: DialFunc if set, otherwise TCP —
+// optionally bound to SourceIP — with TLS on top when TLSConfig is set.
+func (s *Sender) dial(ctx context.Context, host string) (net.Conn, error) {
+	if s.DialFunc != nil {
+		return s.DialFunc(ctx, "tcp", host)
+	}
+
+	dialer := net.Dialer{Timeout: s.ConnectTimeout}
+	if s.SourceIP != "" {
+		ip := net.ParseIP(s.SourceIP)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid SourceIP %q", s.SourceIP)
+		}
+		dialer.LocalAddr = &net.TCPAddr{IP: ip}
+	}
+
+	if s.TLSConfig != nil {
+		tlsDialer := tls.Dialer{NetDialer: &dialer, Config: s.TLSConfig}
+		return tlsDialer.DialContext(ctx, "tcp", host)
+	}
+	return dialer.DialContext(ctx, "tcp", host)
+}
+
 func (s *Sender) sendOnce(ctx context.Context, packet *Packet, host string) (res Response, err error) {
 	// Timeout to resolve and connect to the server; the context can cancel
 	// the dial or shorten the deadline further.
-	dialer := net.Dialer{Timeout: s.ConnectTimeout}
-	conn, err := dialer.DialContext(ctx, "tcp", host)
+	conn, err := s.dial(ctx, host)
 	if err != nil {
 		return res, fmt.Errorf("connecting to %s (timeout=%v): %w", host, s.ConnectTimeout, err)
 	}
