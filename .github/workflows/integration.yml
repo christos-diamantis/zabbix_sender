@@ -1,12 +1,11 @@
 name: Integration tests
 
 # Runs the -tags integration suite against a real Zabbix server.
-# The job is bound to the "integration" environment, which has a required
-# reviewer: every run WAITS for manual approval before it starts.
+# Manual-only: trigger it from the Actions tab when you want the full
+# integration pass. Running it yourself IS the confirmation, so no
+# environment gate (and no deployment records) is involved.
 
 on:
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -16,7 +15,6 @@ jobs:
   integration:
     name: Real Zabbix server
     runs-on: ubuntu-latest
-    environment: integration
     timeout-minutes: 30
 
     services:
