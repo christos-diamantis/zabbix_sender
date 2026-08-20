@@ -16,7 +16,7 @@ Supports modern Zabbix 7.0+ proxy group redirect and multi-host high availabilit
 
 ## 📦 Installation
 ```bash
-go get github.com/christos-diamantis/zabbix_sender
+go get github.com/christos-diamantis/zabbix_sender/v2
 ```
 
 ## 🚀 Quick Start
@@ -28,7 +28,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/christos-diamantis/zabbix_sender"
+    zabbix_sender "github.com/christos-diamantis/zabbix_sender/v2"
 )
 
 func main() {
