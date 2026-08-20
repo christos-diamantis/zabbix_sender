@@ -163,7 +163,25 @@ sender.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, err
 }
 ```
 
-10. Context support
+10. From a Zabbix agent configuration file
+```go
+// Reads ServerActive (fallback Server), Hostname, SourceIP and TLS* keys.
+// One Sender per comma-separated ServerActive destination; semicolon-
+// separated addresses are HA nodes within a destination.
+senders, err := zabbix_sender.NewSenderFromConfig("/etc/zabbix/zabbix_agentd.conf")
+if err != nil {
+    log.Fatal(err)
+}
+for _, s := range senders { // every destination gets a full copy
+    s.SendMetrics(metrics)
+}
+
+// Or inspect the parsed values yourself:
+cfg, _ := zabbix_sender.ParseAgentConfig("/etc/zabbix/zabbix_agentd.conf")
+fmt.Println(cfg.ServerActive, cfg.Hostname, cfg.SourceIP, cfg.TLS)
+```
+
+11. Context support
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 defer cancel()
