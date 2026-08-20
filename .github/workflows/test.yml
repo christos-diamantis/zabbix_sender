@@ -1,0 +1,99 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [ "1.20.x", "1.21.x", "1.22.x", "1.23.x", "1.24.x", "1.25.x" ]
+        platform: [ ubuntu-latest ]
+        include:
+          - go-version: stable
+            platform: macos-latest
+          - go-version: stable
+            platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vet (integration tag)
+        run: go vet -tags integration ./...
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test (race)
+        run: go test -v -race -timeout 5m ./...
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Test with coverage
+        run: go test -race -timeout 5m -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          {
+            echo "### Coverage"
+            echo '```'
+            go tool cover -func=coverage.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce minimum coverage
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{gsub(/%/,""); print $3}')
+          echo "Total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t >= 85.0) ? 0 : 1 }' || {
+            echo "::error::Coverage ${total}% is below the 85% minimum"
+            exit 1
+          }
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # Single required status check for branch protection.
+  tests-passed:
+    name: tests-passed
+    if: always()
+    needs: [ test, coverage ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all test jobs succeeded
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::One or more test jobs failed"
+            exit 1
+          fi

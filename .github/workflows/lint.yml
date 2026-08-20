@@ -1,0 +1,70 @@
+name: Lint
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Files not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check go.mod tidiness
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod; then
+            echo "::error::go.mod is not tidy; run 'go mod tidy'"
+            exit 1
+          fi
+
+  golangci:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m --build-tags=integration
+
+  # Single required status check for branch protection.
+  lint-passed:
+    name: lint-passed
+    if: always()
+    needs: [ gofmt, golangci ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all lint jobs succeeded
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::One or more lint jobs failed"
+            exit 1
+          fi
