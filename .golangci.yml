@@ -1,0 +1,26 @@
+version: "2"
+
+run:
+  build-tags:
+    - integration
+
+linters:
+  settings:
+    errcheck:
+      # Best-effort calls: a failure here surfaces immediately on the
+      # following read/write with a proper error, so checking these
+      # separately adds noise without information.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (net.Conn).SetDeadline
+        - (net.Conn).SetReadDeadline
+        - (net.Conn).SetWriteDeadline
+        - (*os.File).Close
+        - (io.ReadCloser).Close
+  exclusions:
+    rules:
+      # Test helpers and mock servers intentionally fire-and-forget.
+      - path: _test\.go
+        linters:
+          - errcheck

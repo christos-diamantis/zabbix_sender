@@ -39,16 +39,31 @@ func parseHostPort(addr string) (string, error) {
 	return addr, nil
 }
 
+// defaultPort is the standard Zabbix trapper port.
+const defaultPort = "10051"
+
 // normalizeHost ensures the address has a port; defaults to 10051 if missing.
+// Bare IPv6 literals are bracketed so the address is dialable.
 func normalizeHost(addr string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return addr
 	}
+	// bracketed IPv6, with or without port: "[::1]:10051" or "[::1]"
+	if strings.HasPrefix(addr, "[") {
+		if strings.Contains(addr, "]:") {
+			return addr
+		}
+		return addr + ":" + defaultPort
+	}
+	// bare IPv6 literal: more than one colon
+	if strings.Count(addr, ":") > 1 {
+		return "[" + addr + "]:" + defaultPort
+	}
 	if strings.Contains(addr, ":") {
 		return addr
 	}
-	return addr + ":10051"
+	return addr + ":" + defaultPort
 }
 
 // GetInfo parses success response "info" field into statistics.
@@ -56,20 +71,20 @@ func (r *Response) GetInfo() (*ResponseInfo, error) {
 	ret := new(ResponseInfo)
 
 	if r.Response != "success" {
-		return nil, fmt.Errorf("Can not process info if response not Success (%s)", r.Response)
+		return nil, fmt.Errorf("cannot parse info of a non-success response (%s)", r.Response)
 	}
 
 	sp := strings.Split(r.Info, ";")
 	if len(sp) != 4 {
-		return nil, fmt.Errorf("Error in splited data, expected 4 got %d for data (%s)", len(sp), r.Info)
+		return nil, fmt.Errorf("invalid info format, expected 4 fields got %d (%s)", len(sp), r.Info)
 	}
 	for i := range sp {
-		sp2 := strings.Split(sp[i], ":")
-		if len(sp2) != 2 {
-			return nil, fmt.Errorf("Error in splited data, expected 2 got %d for data (%s)", len(sp2), sp[i])
+		key, value, found := strings.Cut(sp[i], ":")
+		if !found {
+			return nil, fmt.Errorf("invalid info field (%s)", sp[i])
 		}
-		key := strings.TrimSpace(sp2[0])
-		value := strings.TrimSpace(sp2[1])
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
 		var err error
 		switch key {
 		case "processed":
@@ -80,12 +95,12 @@ func (r *Response) GetInfo() (*ResponseInfo, error) {
 			ret.Total, err = strconv.Atoi(value)
 		case "seconds spent":
 			var f float64
-			if f, err = strconv.ParseFloat(value, 64); err != nil {
-				return nil, fmt.Errorf("Error in parsing seconds spent value [%s] error: %s", value, err)
-			}
-			ret.Spent = time.Duration(int64(f * 1000000000.0))
+			f, err = strconv.ParseFloat(value, 64)
+			ret.Spent = time.Duration(f * float64(time.Second))
 		}
-
+		if err != nil {
+			return nil, fmt.Errorf("parsing info field %q value %q: %w", key, value, err)
+		}
 	}
 
 	return ret, nil

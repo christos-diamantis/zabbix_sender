@@ -1,0 +1,114 @@
+name: Integration tests
+
+# Runs the -tags integration suite against a real Zabbix server.
+# The job is bound to the "integration" environment, which has a required
+# reviewer: every run WAITS for manual approval before it starts.
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Real Zabbix server
+    runs-on: ubuntu-latest
+    environment: integration
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: zabbix
+          POSTGRES_PASSWORD: zabbix
+          POSTGRES_DB: zabbix
+        options: >-
+          --health-cmd "pg_isready -U zabbix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      zabbix-server:
+        image: zabbix/zabbix-server-pgsql:alpine-7.0-latest
+        env:
+          DB_SERVER_HOST: postgres
+          POSTGRES_USER: zabbix
+          POSTGRES_PASSWORD: zabbix
+          POSTGRES_DB: zabbix
+          ZBX_CACHEUPDATEFREQUENCY: 1
+        ports:
+          - 10051:10051
+
+      zabbix-web:
+        image: zabbix/zabbix-web-nginx-pgsql:alpine-7.0-latest
+        env:
+          DB_SERVER_HOST: postgres
+          POSTGRES_USER: zabbix
+          POSTGRES_PASSWORD: zabbix
+          POSTGRES_DB: zabbix
+          ZBX_SERVER_HOST: zabbix-server
+        ports:
+          - 8080:8080
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Wait for Zabbix API
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null -H 'Content-Type: application/json' \
+                 -d '{"jsonrpc":"2.0","method":"apiinfo.version","params":{},"id":1}' \
+                 http://127.0.0.1:8080/api_jsonrpc.php; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Zabbix API did not come up"
+          exit 1
+
+      - name: Create test host and trapper item via API
+        run: |
+          api() {
+            curl -fsS -H 'Content-Type: application/json' -d "$1" http://127.0.0.1:8080/api_jsonrpc.php
+          }
+
+          token=$(api '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' | jq -re '.result')
+
+          group_id=$(api '{"jsonrpc":"2.0","method":"hostgroup.create","params":{"name":"integration-tests"},"auth":"'"$token"'","id":2}' | jq -re '.result.groupids[0]')
+
+          host_id=$(api '{"jsonrpc":"2.0","method":"host.create","params":{"host":"test-api","groups":[{"groupid":"'"$group_id"'"}]},"auth":"'"$token"'","id":3}' | jq -re '.result.hostids[0]')
+
+          api '{"jsonrpc":"2.0","method":"item.create","params":{"hostid":"'"$host_id"'","name":"master item","key_":"master_item","type":2,"value_type":4},"auth":"'"$token"'","id":4}' | jq -e '.result.itemids[0]'
+
+          # let the server's configuration cache pick up the new item
+          sleep 10
+
+      - name: Wait for trapper port
+        run: |
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/10051) 2>/dev/null; then
+              exec 3>&-
+              echo "Trapper port is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Zabbix trapper port did not come up"
+          exit 1
+
+      - name: Run integration tests
+        env:
+          ZABBIX_ADDR: 127.0.0.1:10051
+          ZABBIX_TEST_HOST: test-api
+          ZABBIX_TEST_KEY: master_item
+        run: go test -v -race -tags integration -run TestIntegration -timeout 5m ./...

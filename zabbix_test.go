@@ -380,7 +380,8 @@ func TestRegisterHostSuccess(t *testing.T) {
 	}
 }
 
-// TestRegisterHostNotFound tests error when host doesn't exist
+// TestRegisterHostNotFound tests error when autoregistration keeps failing:
+// the server answers "failed" on the initial call and on the confirmation retry.
 func TestRegisterHostNotFound(t *testing.T) {
 	mock := newMockZabbixServer(t)
 	defer mock.Close()
@@ -388,30 +389,35 @@ func TestRegisterHostNotFound(t *testing.T) {
 	serverDone := make(chan error, 1)
 
 	go func() {
-		conn, err := mock.listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+		for i := 0; i < 2; i++ {
+			conn, err := mock.listener.Accept()
+			if err != nil {
+				serverDone <- err
+				return
+			}
 
-		request, err := mock.readZabbixRequest(conn)
-		if err != nil {
-			serverDone <- err
-			return
-		}
+			request, err := mock.readZabbixRequest(conn)
+			if err != nil {
+				conn.Close()
+				serverDone <- err
+				return
+			}
 
-		if request.Request != "active checks" {
-			serverDone <- fmt.Errorf("expected 'active checks', got '%s'", request.Request)
-			return
-		}
+			if request.Request != "active checks" {
+				conn.Close()
+				serverDone <- fmt.Errorf("expected 'active checks', got '%s'", request.Request)
+				return
+			}
 
-		// Host not found - return failure
-		jsonResp := `{"response":"failed","info":"host [prueba] not found"}`
-		if err := mock.writeZabbixResponse(conn, jsonResp); err != nil {
-			serverDone <- err
-			return
+			// Host not found - return failure on both calls
+			jsonResp := `{"response":"failed","info":"host [prueba] not found"}`
+			if err := mock.writeZabbixResponse(conn, jsonResp); err != nil {
+				conn.Close()
+				serverDone <- err
+				return
+			}
+			conn.Close()
 		}
-
 		serverDone <- nil
 	}()
 
@@ -423,13 +429,58 @@ func TestRegisterHostNotFound(t *testing.T) {
 
 	t.Logf("Got expected error: %v", err)
 
-	select {
-	case err := <-serverDone:
-		if err != nil {
-			t.Fatalf("Mock server error: %v", err)
+	if err := <-serverDone; err != nil {
+		t.Fatalf("Mock server error: %v", err)
+	}
+}
+
+// TestRegisterHostAutoregistrationFlow reproduces the real Zabbix
+// autoregistration flow: the first "active checks" request answers "failed"
+// (host not found, which triggers the server-side autoregistration) and the
+// confirmation retry answers "success".
+func TestRegisterHostAutoregistrationFlow(t *testing.T) {
+	mock := newMockZabbixServer(t)
+	defer mock.Close()
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		for i := 0; i < 2; i++ {
+			conn, err := mock.listener.Accept()
+			if err != nil {
+				serverDone <- err
+				return
+			}
+
+			if _, err := mock.readZabbixRequest(conn); err != nil {
+				conn.Close()
+				serverDone <- err
+				return
+			}
+
+			var jsonResp string
+			if i == 0 {
+				jsonResp = `{"response":"failed","info":"host [newhost] not found"}`
+			} else {
+				jsonResp = `{"response":"success","data":[]}`
+			}
+			if err := mock.writeZabbixResponse(conn, jsonResp); err != nil {
+				conn.Close()
+				serverDone <- err
+				return
+			}
+			conn.Close()
 		}
-	case <-time.After(500 * time.Millisecond):
-		// Server might still be waiting, that's OK
+		serverDone <- nil
+	}()
+
+	s := NewSender(mock.address)
+	if err := s.RegisterHost("newhost", "meta"); err != nil {
+		t.Fatalf("RegisterHost should succeed on failed-then-success flow, got: %v", err)
+	}
+
+	if err := <-serverDone; err != nil {
+		t.Fatalf("Mock server error: %v", err)
 	}
 }
 
@@ -556,54 +607,5 @@ func TestNormalizeHost_DefaultPort(t *testing.T) {
 	}
 }
 
-// Integration tests - these require a real Zabbix server running
-// Mark them to skip if not in integration test mode
-
-func TestIntegration_SendMetrics(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	metrics := []*Metric{
-		NewMetric("test-api", "master_item", "this-is-a-test", false),
-	}
-
-	z := NewSender("127.0.0.1:10051")
-	z.MaxRedirects = 5
-	z.UpdateHost = true
-
-	resActive, errActive, resTrapper, errTrapper := z.SendMetrics(metrics)
-
-	t.Logf("Active: %s (error: %v)", resActive.Response, errActive)
-	t.Logf("Trapper: response=%s, info=%s, error=%v", resTrapper.Response, resTrapper.Info, errTrapper)
-
-	// Note: This will fail without a real Zabbix server
-	// Consider using t.Skip() if server is not available
-	if errActive != nil && errTrapper != nil {
-		t.Skip("Skipping: No Zabbix server available")
-	}
-}
-
-func TestIntegration_MultiHosts(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	hosts := []string{"127.0.0.1:10051", "127.0.0.1:20051", "127.0.0.1:30051"}
-	z := NewSenderHosts(hosts)
-	z.MaxRedirects = 5
-
-	metrics := []*Metric{
-		NewMetric("test-api", "master_item", "multi-host-test", false),
-	}
-
-	resActive, errActive, resTrapper, errTrapper := z.SendMetrics(metrics)
-
-	t.Logf("Active: %s (error: %v)", resActive.Response, errActive)
-	t.Logf("Trapper: response=%s, info=%s, error=%v", resTrapper.Response, resTrapper.Info, errTrapper)
-
-	// Note: This will fail without real Zabbix servers
-	if errActive != nil && errTrapper != nil {
-		t.Skip("Skipping: No Zabbix servers available")
-	}
-}
+// Integration tests against a real Zabbix server live in integration_test.go
+// (build tag "integration", configured via ZABBIX_ADDR).
