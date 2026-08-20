@@ -69,7 +69,7 @@ func TestIntegration_SendTrapperMetric(t *testing.T) {
 		t.Errorf("expected processed=1, got %d (is the trapper item configured?)", info.Processed)
 	}
 
-	if z.PrimaryHost == "" {
+	if z.PrimaryHost() == "" {
 		t.Error("PrimaryHost should be cached after a successful send")
 	}
 }
@@ -85,14 +85,14 @@ func TestIntegration_PrimaryHostReuse(t *testing.T) {
 		t.Fatalf("first send: %v", err)
 	}
 
-	cached := z.PrimaryHost
+	cached := z.PrimaryHost()
 	metrics = []*Metric{NewMetric(testHost, testKey, "integration-test-2", false)}
 	if _, _, _, err := z.SendMetrics(metrics); err != nil {
 		t.Fatalf("second send: %v", err)
 	}
 
-	if z.PrimaryHost != cached {
-		t.Errorf("PrimaryHost changed between sends: %s -> %s", cached, z.PrimaryHost)
+	if z.PrimaryHost() != cached {
+		t.Errorf("PrimaryHost changed between sends: %s -> %s", cached, z.PrimaryHost())
 	}
 }
 
