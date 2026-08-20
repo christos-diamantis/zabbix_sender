@@ -140,6 +140,36 @@ if err == nil {
 }
 ```
 
+9. TLS (certificate-based, like `TLSConnect=cert`)
+```go
+tlsConfig, err := zabbix_sender.TLSConfigFromFiles(
+    "/etc/zabbix/ca.pem",     // TLSCAFile ("" = system CAs)
+    "/etc/zabbix/cert.pem",   // TLSCertFile ("" = no client cert)
+    "/etc/zabbix/key.pem",    // TLSKeyFile
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+sender := zabbix_sender.NewSender("zabbix-server:10051")
+sender.TLSConfig = tlsConfig
+sender.SourceIP = "192.0.2.10" // optional, like Zabbix SourceIP
+```
+TLS-PSK is not implemented by Go's `crypto/tls`. If you need PSK, plug your own transport
+(e.g. an OpenSSL-backed dialer) via the hook that replaces the built-in dialer:
+```go
+sender.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+    return myPSKDialer.DialContext(ctx, network, addr)
+}
+```
+
+10. Context support
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+resActive, errActive, resTrapper, errTrapper := sender.SendMetricsContext(ctx, metrics)
+```
+
 ## 🔧 Advanced Configuration
 ```go
 sender := zabbix_sender.NewSenderHosts(hosts)
