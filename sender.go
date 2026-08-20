@@ -18,6 +18,11 @@ var zabbixHeader = []byte("ZBXD\x01")
 // headerLen is the full header size: "ZBXD" + flags byte + 8-byte data length.
 const headerLen = 13
 
+// maxPacketSize caps outgoing packet bodies. It bounds the length arithmetic
+// of the send buffer (flagged by CodeQL as a potential allocation-size
+// overflow) and is far beyond any real Zabbix payload.
+const maxPacketSize = 1 << 30 // 1 GiB
+
 // Sender struct.
 type Sender struct {
 	Hosts          []string // ordered list of proxies/servers; first successful cached in PrimaryHost
@@ -156,6 +161,9 @@ func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error)
 	body, err := json.Marshal(packet)
 	if err != nil {
 		return res, fmt.Errorf("marshaling packet: %w", err)
+	}
+	if len(body) > maxPacketSize {
+		return res, fmt.Errorf("packet too large: %d bytes (limit %d)", len(body), maxPacketSize)
 	}
 
 	buffer := make([]byte, 0, headerLen+len(body))
