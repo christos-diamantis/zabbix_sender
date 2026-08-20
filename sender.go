@@ -2,6 +2,7 @@ package zabbix_sender
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -18,7 +19,15 @@ import (
 // https://www.zabbix.com/documentation/current/en/manual/appendix/protocols/header_datalen
 var zabbixHeader = []byte("ZBXD\x01")
 
-// headerLen is the full header size: "ZBXD" + flags byte + 8-byte data length.
+// Zabbix protocol flag bits.
+const (
+	flagProtocol    = 0x01 // Zabbix communications protocol
+	flagCompression = 0x02 // body is zlib-compressed
+	flagLargePacket = 0x04 // 8-byte length fields (not supported, like python-zabbix-utils)
+)
+
+// headerLen is the full header size: "ZBXD" + flags byte + 4-byte data
+// length + 4-byte reserved (uncompressed length when compressed).
 const headerLen = 13
 
 // maxPacketSize caps outgoing packet bodies. It bounds the length arithmetic
@@ -58,6 +67,10 @@ type Sender struct {
 	// summed statistics. 0 means DefaultChunkSize, negative disables
 	// chunking.
 	ChunkSize int
+
+	// Compression zlib-compresses outgoing packets (protocol flag 0x02).
+	// Compressed responses are always accepted, regardless of this flag.
+	Compression bool
 
 	// TLSConfig enables certificate-based TLS (Zabbix TLSConnect=cert)
 	// when non-nil. Ignored when DialFunc is set.
@@ -339,10 +352,34 @@ func (s *Sender) sendOnce(ctx context.Context, packet *Packet, host string) (res
 		return res, fmt.Errorf("packet too large: %d bytes (limit %d)", len(body), maxPacketSize)
 	}
 
-	buffer := make([]byte, 0, headerLen+len(body))
-	buffer = append(buffer, zabbixHeader...)
-	buffer = binary.LittleEndian.AppendUint64(buffer, uint64(len(body)))
-	buffer = append(buffer, body...)
+	// Header layout: "ZBXD" + flags + uint32 datalen + uint32 reserved.
+	// When compressed: datalen = compressed size, reserved = uncompressed size.
+	flags := byte(flagProtocol)
+	payload := body
+	var reserved uint32
+	if s.Compression {
+		var compressed bytes.Buffer
+		zw := zlib.NewWriter(&compressed)
+		if _, err := zw.Write(body); err != nil {
+			return res, fmt.Errorf("compressing packet: %w", err)
+		}
+		if err := zw.Close(); err != nil {
+			return res, fmt.Errorf("compressing packet: %w", err)
+		}
+		flags |= flagCompression
+		reserved = uint32(len(body))
+		payload = compressed.Bytes()
+	}
+	if len(payload) > maxPacketSize {
+		return res, fmt.Errorf("packet too large: %d bytes (large-packet flag not supported)", len(payload))
+	}
+
+	buffer := make([]byte, 0, headerLen+len(payload))
+	buffer = append(buffer, "ZBXD"...)
+	buffer = append(buffer, flags)
+	buffer = binary.LittleEndian.AppendUint32(buffer, uint32(len(payload)))
+	buffer = binary.LittleEndian.AppendUint32(buffer, reserved)
+	buffer = append(buffer, payload...)
 
 	// Write timeout
 	conn.SetWriteDeadline(earliestDeadline(ctx, s.WriteTimeout))
@@ -362,22 +399,45 @@ func (s *Sender) sendOnce(ctx context.Context, packet *Packet, host string) (res
 		return res, fmt.Errorf("reading the response header from %s (timeout=%v): %w", host, s.ReadTimeout, err)
 	}
 
-	if !bytes.Equal(header[:5], zabbixHeader) {
+	if !bytes.Equal(header[:4], zabbixHeader[:4]) {
 		return res, fmt.Errorf("got no valid header [%+v], expected [%+v]", header[:5], zabbixHeader)
+	}
+	respFlags := header[4]
+	if respFlags&flagProtocol == 0 {
+		return res, fmt.Errorf("response from %s has unexpected protocol flags 0x%02x", host, respFlags)
+	}
+	if respFlags&flagLargePacket != 0 {
+		return res, fmt.Errorf("response from %s uses the large-packet flag, which is not supported", host)
 	}
 
 	maxSize := s.MaxResponseSize
 	if maxSize == 0 {
 		maxSize = DefaultMaxResponseSize
 	}
-	dataLen := binary.LittleEndian.Uint64(header[5:])
-	if dataLen > maxSize {
+	dataLen := uint64(binary.LittleEndian.Uint32(header[5:9]))
+	uncompressedLen := uint64(binary.LittleEndian.Uint32(header[9:13]))
+	if dataLen > maxSize || uncompressedLen > maxSize {
 		return res, fmt.Errorf("response from %s too large: header announces %d bytes, limit is %d", host, dataLen, maxSize)
 	}
 
 	data := make([]byte, dataLen)
 	if _, err := io.ReadFull(conn, data); err != nil {
 		return res, fmt.Errorf("incomplete response from %s: header announces %d bytes: %w", host, dataLen, err)
+	}
+
+	if respFlags&flagCompression != 0 {
+		zr, err := zlib.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return res, fmt.Errorf("decompressing response from %s: %w", host, err)
+		}
+		data, err = io.ReadAll(io.LimitReader(zr, int64(maxSize)+1))
+		zr.Close()
+		if err != nil {
+			return res, fmt.Errorf("decompressing response from %s: %w", host, err)
+		}
+		if uint64(len(data)) > maxSize {
+			return res, fmt.Errorf("response from %s too large after decompression, limit is %d", host, maxSize)
+		}
 	}
 
 	if err := json.Unmarshal(data, &res); err != nil {
