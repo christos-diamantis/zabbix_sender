@@ -25,6 +25,11 @@ const headerLen = 13
 // overflow) and is far beyond any real Zabbix payload.
 const maxPacketSize = 1 << 30 // 1 GiB
 
+// DefaultMaxResponseSize caps how large a response body the sender accepts
+// when Sender.MaxResponseSize is 0. Real Zabbix answers are tiny; the cap
+// only guards against a broken or malicious peer.
+const DefaultMaxResponseSize = 16 << 20 // 16 MiB
+
 // Sender sends packets to a Zabbix server/proxy.
 //
 // A Sender is safe for concurrent use by multiple goroutines: sends run in
@@ -38,6 +43,10 @@ type Sender struct {
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
+
+	// MaxResponseSize caps the response body length the sender accepts.
+	// 0 means DefaultMaxResponseSize.
+	MaxResponseSize uint64
 
 	mu          sync.RWMutex
 	primaryHost string // cached working host (empty = try Hosts in order)
@@ -246,27 +255,33 @@ func (s *Sender) sendOnce(ctx context.Context, packet *Packet, host string) (res
 		return res, fmt.Errorf("sending the data to %s (timeout=%v): %w", host, s.WriteTimeout, err)
 	}
 
-	// Read timeout; the server closes the connection after answering
+	// Read timeout
 	conn.SetReadDeadline(earliestDeadline(ctx, s.ReadTimeout))
-	response, err := io.ReadAll(conn)
-	if err != nil {
-		return res, fmt.Errorf("reading the response from %s (timeout=%v): %w", host, s.ReadTimeout, err)
+
+	// Read exactly one length-prefixed response instead of reading until
+	// the server closes the connection.
+	header := make([]byte, headerLen)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return res, fmt.Errorf("reading the response header from %s (timeout=%v): %w", host, s.ReadTimeout, err)
 	}
 
-	if len(response) < headerLen {
-		return res, fmt.Errorf("response too short from %s: %d bytes", host, len(response))
+	if !bytes.Equal(header[:5], zabbixHeader) {
+		return res, fmt.Errorf("got no valid header [%+v], expected [%+v]", header[:5], zabbixHeader)
 	}
 
-	if !bytes.Equal(response[:5], zabbixHeader) {
-		return res, fmt.Errorf("got no valid header [%+v], expected [%+v]", response[:5], zabbixHeader)
+	maxSize := s.MaxResponseSize
+	if maxSize == 0 {
+		maxSize = DefaultMaxResponseSize
+	}
+	dataLen := binary.LittleEndian.Uint64(header[5:])
+	if dataLen > maxSize {
+		return res, fmt.Errorf("response from %s too large: header announces %d bytes, limit is %d", host, dataLen, maxSize)
 	}
 
-	dataLen := binary.LittleEndian.Uint64(response[5:headerLen])
-	data := response[headerLen:]
-	if uint64(len(data)) < dataLen {
-		return res, fmt.Errorf("incomplete response from %s: header announces %d bytes, got %d", host, dataLen, len(data))
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		return res, fmt.Errorf("incomplete response from %s: header announces %d bytes: %w", host, dataLen, err)
 	}
-	data = data[:dataLen]
 
 	if err := json.Unmarshal(data, &res); err != nil {
 		return res, fmt.Errorf("zabbix response from %s is not valid: %w", host, err)

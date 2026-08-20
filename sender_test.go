@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -398,5 +399,35 @@ func TestConcurrentSends(t *testing.T) {
 
 	if got := s.PrimaryHost(); got != live.address {
 		t.Errorf("PrimaryHost: expected %s, got %s", live.address, got)
+	}
+}
+
+func TestSendResponseTooLarge(t *testing.T) {
+	mock := newMockZabbixServer(t)
+	defer mock.Close()
+
+	go func() {
+		conn, err := mock.listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := mock.readZabbixRequest(conn); err != nil {
+			return
+		}
+		// announce a body far beyond the configured limit
+		resp := append([]byte("ZBXD\x01"), encodeDataLength(1<<30)...)
+		conn.Write(resp)
+	}()
+
+	s := NewSender(mock.address)
+	s.MaxResponseSize = 1024
+
+	_, err := sendTestPacket(s)
+	if err == nil {
+		t.Fatal("expected error for oversized response")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("expected 'too large' error, got: %v", err)
 	}
 }
