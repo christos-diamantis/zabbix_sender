@@ -2,12 +2,14 @@ package zabbix_sender
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -23,15 +25,47 @@ const headerLen = 13
 // overflow) and is far beyond any real Zabbix payload.
 const maxPacketSize = 1 << 30 // 1 GiB
 
-// Sender struct.
+// Sender sends packets to a Zabbix server/proxy.
+//
+// A Sender is safe for concurrent use by multiple goroutines: sends run in
+// parallel, and the working-host cache is internally synchronized. The
+// configuration fields (Hosts, MaxRedirects, timeouts, ...) are read without
+// locking and must be set before the Sender is shared between goroutines.
 type Sender struct {
-	Hosts          []string // ordered list of proxies/servers; first successful cached in PrimaryHost
-	PrimaryHost    string   // cached working host (empty = try Hosts in order)
+	Hosts          []string // ordered list of proxies/servers; first successful cached as primary host
 	MaxRedirects   int      // max redirect attempts before error; default is 3
 	UpdateHost     bool     // if true, cache the final redirect target instead of the starting host
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
+
+	mu          sync.RWMutex
+	primaryHost string // cached working host (empty = try Hosts in order)
+}
+
+// PrimaryHost returns the cached working host (empty = none cached yet).
+func (s *Sender) PrimaryHost() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.primaryHost
+}
+
+// SetPrimaryHost pre-sets (or, with "", clears) the cached working host.
+func (s *Sender) SetPrimaryHost(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.primaryHost = host
+}
+
+// setPrimaryHostIf updates the cache only if it still holds expected, so a
+// concurrent send that already refreshed the cache is not overwritten with
+// stale information.
+func (s *Sender) setPrimaryHostIf(expected, host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.primaryHost == expected {
+		s.primaryHost = host
+	}
 }
 
 // ResponseError is returned when a server/proxy was reached and answered with
@@ -56,6 +90,12 @@ func isResponseError(err error) bool {
 // Automatically separates into "agent data" and "sender data" packets.
 // Returns 4 values: (activeRes, activeErr, trapperRes, trapperErr)
 func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive error, resTrapper Response, errTrapper error) {
+	return s.SendMetricsContext(context.Background(), metrics)
+}
+
+// SendMetricsContext is SendMetrics honoring the context's deadline and
+// cancellation on top of the Sender's own timeouts.
+func (s *Sender) SendMetricsContext(ctx context.Context, metrics []*Metric) (resActive Response, errActive error, resTrapper Response, errTrapper error) {
 	var trapperMetrics []*Metric
 	var activeMetrics []*Metric
 
@@ -69,12 +109,12 @@ func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive e
 
 	if len(trapperMetrics) > 0 {
 		packetTrapper := NewPacket(trapperMetrics, false)
-		resTrapper, errTrapper = s.Send(packetTrapper)
+		resTrapper, errTrapper = s.SendContext(ctx, packetTrapper)
 	}
 
 	if len(activeMetrics) > 0 {
 		packetActive := NewPacket(activeMetrics, true)
-		resActive, errActive = s.Send(packetActive)
+		resActive, errActive = s.SendContext(ctx, packetActive)
 	}
 
 	return resActive, errActive, resTrapper, errTrapper
@@ -85,31 +125,42 @@ func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive e
 // only on transport errors; a host that answers (even with "failed") is
 // considered reachable and its answer final (see ResponseError).
 func (s *Sender) Send(packet *Packet) (Response, error) {
-	if s.PrimaryHost == "" && len(s.Hosts) == 0 {
+	return s.SendContext(context.Background(), packet)
+}
+
+// SendContext is Send honoring the context's deadline and cancellation on
+// top of the Sender's own timeouts.
+func (s *Sender) SendContext(ctx context.Context, packet *Packet) (Response, error) {
+	primary := s.PrimaryHost()
+	if primary == "" && len(s.Hosts) == 0 {
 		return Response{}, errors.New("no hosts configured")
 	}
 
 	var lastErr error
 
-	if s.PrimaryHost != "" {
-		res, final, err := s.sendWithRedirects(packet, s.PrimaryHost)
+	if primary != "" {
+		res, final, err := s.sendWithRedirects(ctx, packet, primary)
 		if err == nil || isResponseError(err) {
 			if s.UpdateHost && final != "" {
-				s.PrimaryHost = final
+				s.setPrimaryHostIf(primary, final)
 			}
 			return res, err
 		}
 		lastErr = err
-		s.PrimaryHost = "" // clear cache, fall back to the host list
+		s.setPrimaryHostIf(primary, "") // clear cache, fall back to the host list
 	}
 
 	for _, host := range s.Hosts {
-		res, final, err := s.sendWithRedirects(packet, host)
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
+		res, final, err := s.sendWithRedirects(ctx, packet, host)
 		if err == nil || isResponseError(err) {
-			s.PrimaryHost = host
+			cached := host
 			if s.UpdateHost && final != "" {
-				s.PrimaryHost = final
+				cached = final
 			}
+			s.SetPrimaryHost(cached)
 			return res, err
 		}
 		lastErr = err
@@ -120,11 +171,14 @@ func (s *Sender) Send(packet *Packet) (Response, error) {
 
 // sendWithRedirects follows proxy group redirects up to MaxRedirects and
 // returns the final host that answered.
-func (s *Sender) sendWithRedirects(packet *Packet, startHost string) (res Response, finalHost string, err error) {
+func (s *Sender) sendWithRedirects(ctx context.Context, packet *Packet, startHost string) (res Response, finalHost string, err error) {
 	currentHost := startHost
 
 	for redirectCount := 0; redirectCount <= s.MaxRedirects; redirectCount++ {
-		res, err = s.sendOnce(packet, currentHost)
+		if err := ctx.Err(); err != nil {
+			return res, currentHost, err
+		}
+		res, err = s.sendOnce(ctx, packet, currentHost)
 		if err != nil {
 			return res, currentHost, fmt.Errorf("sendOnce to %s failed: %w", currentHost, err)
 		}
@@ -150,13 +204,26 @@ func (s *Sender) sendWithRedirects(packet *Packet, startHost string) (res Respon
 	return res, currentHost, fmt.Errorf("max redirects exceeded from %s", startHost)
 }
 
-func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error) {
-	// Timeout to resolve and connect to the server
-	conn, err := net.DialTimeout("tcp", host, s.ConnectTimeout)
+func (s *Sender) sendOnce(ctx context.Context, packet *Packet, host string) (res Response, err error) {
+	// Timeout to resolve and connect to the server; the context can cancel
+	// the dial or shorten the deadline further.
+	dialer := net.Dialer{Timeout: s.ConnectTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return res, fmt.Errorf("connecting to %s (timeout=%v): %w", host, s.ConnectTimeout, err)
 	}
 	defer conn.Close()
+
+	// Abort in-flight reads/writes as soon as the context is canceled.
+	watcherDone := make(chan struct{})
+	defer close(watcherDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(time.Now())
+		case <-watcherDone:
+		}
+	}()
 
 	body, err := json.Marshal(packet)
 	if err != nil {
@@ -172,7 +239,7 @@ func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error)
 	buffer = append(buffer, body...)
 
 	// Write timeout
-	conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
+	conn.SetWriteDeadline(earliestDeadline(ctx, s.WriteTimeout))
 
 	// Send packet to zabbix
 	if _, err = conn.Write(buffer); err != nil {
@@ -180,7 +247,7 @@ func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error)
 	}
 
 	// Read timeout; the server closes the connection after answering
-	conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
+	conn.SetReadDeadline(earliestDeadline(ctx, s.ReadTimeout))
 	response, err := io.ReadAll(conn)
 	if err != nil {
 		return res, fmt.Errorf("reading the response from %s (timeout=%v): %w", host, s.ReadTimeout, err)
@@ -208,15 +275,31 @@ func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error)
 	return res, nil
 }
 
+// earliestDeadline returns now+timeout, or the context's deadline if that
+// comes first.
+func earliestDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
 // RegisterHost sends host autoregistration request ("active checks").
 // A first "failed" answer is expected for unknown hosts (it is what triggers
 // the server-side autoregistration), so it retries once to confirm.
 func (s *Sender) RegisterHost(host, hostmetadata string) error {
+	return s.RegisterHostContext(context.Background(), host, hostmetadata)
+}
+
+// RegisterHostContext is RegisterHost honoring the context's deadline and
+// cancellation on top of the Sender's own timeouts.
+func (s *Sender) RegisterHostContext(ctx context.Context, host, hostmetadata string) error {
 	newPacket := func() *Packet {
 		return &Packet{Request: "active checks", Host: host, HostMetadata: hostmetadata}
 	}
 
-	_, err := s.Send(newPacket())
+	_, err := s.SendContext(ctx, newPacket())
 	if err == nil {
 		return nil // host already registered
 	}
@@ -226,7 +309,7 @@ func (s *Sender) RegisterHost(host, hostmetadata string) error {
 
 	// The first call answered "failed", which triggers the autoregistration.
 	// Call again to verify the host is now registered.
-	_, err = s.Send(newPacket())
+	_, err = s.SendContext(ctx, newPacket())
 	if err == nil {
 		return nil
 	}

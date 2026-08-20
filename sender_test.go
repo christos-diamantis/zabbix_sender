@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,8 +72,8 @@ func TestSendRedirect(t *testing.T) {
 	}
 
 	// UpdateHost is false: the starting host stays cached
-	if s.PrimaryHost != redirector.address {
-		t.Errorf("PrimaryHost: expected starting host %s, got %s", redirector.address, s.PrimaryHost)
+	if s.PrimaryHost() != redirector.address {
+		t.Errorf("PrimaryHost: expected starting host %s, got %s", redirector.address, s.PrimaryHost())
 	}
 
 	if err := <-redirectorDone; err != nil {
@@ -101,8 +102,8 @@ func TestSendRedirectUpdateHost(t *testing.T) {
 	}
 
 	// UpdateHost is true: the final redirect target is cached
-	if s.PrimaryHost != target.address {
-		t.Errorf("PrimaryHost: expected redirect target %s, got %s", target.address, s.PrimaryHost)
+	if s.PrimaryHost() != target.address {
+		t.Errorf("PrimaryHost: expected redirect target %s, got %s", target.address, s.PrimaryHost())
 	}
 
 	if err := <-redirectorDone; err != nil {
@@ -153,8 +154,8 @@ func TestSendFailover(t *testing.T) {
 	if res.Response != "success" {
 		t.Errorf("expected success response, got %q", res.Response)
 	}
-	if s.PrimaryHost != live.address {
-		t.Errorf("PrimaryHost: expected %s, got %s", live.address, s.PrimaryHost)
+	if s.PrimaryHost() != live.address {
+		t.Errorf("PrimaryHost: expected %s, got %s", live.address, s.PrimaryHost())
 	}
 
 	if err := <-done; err != nil {
@@ -168,14 +169,14 @@ func TestSendPrimaryHostCacheInvalidation(t *testing.T) {
 	done := serveResponses(live, successResp)
 
 	s := NewSenderHosts([]string{live.address})
-	s.PrimaryHost = deadAddress(t) // stale cache pointing to a dead host
+	s.SetPrimaryHost(deadAddress(t)) // stale cache pointing to a dead host
 
 	_, err := sendTestPacket(s)
 	if err != nil {
 		t.Fatalf("Send should fall back to the host list: %v", err)
 	}
-	if s.PrimaryHost != live.address {
-		t.Errorf("PrimaryHost: expected refreshed cache %s, got %s", live.address, s.PrimaryHost)
+	if s.PrimaryHost() != live.address {
+		t.Errorf("PrimaryHost: expected refreshed cache %s, got %s", live.address, s.PrimaryHost())
 	}
 
 	if err := <-done; err != nil {
@@ -191,8 +192,8 @@ func TestSendAllHostsFailed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when all hosts are unreachable")
 	}
-	if s.PrimaryHost != "" {
-		t.Errorf("PrimaryHost should stay empty, got %s", s.PrimaryHost)
+	if s.PrimaryHost() != "" {
+		t.Errorf("PrimaryHost should stay empty, got %s", s.PrimaryHost())
 	}
 }
 
@@ -338,5 +339,64 @@ func TestSendMetricsEmpty(t *testing.T) {
 	}
 	if _, err := resTrapper.GetInfo(); err == nil {
 		t.Error("GetInfo on zero trapper response should fail")
+	}
+}
+
+// serveSuccessLoop answers every incoming connection with a success response
+// until the listener is closed.
+func serveSuccessLoop(mock *mockZabbixServer) {
+	go func() {
+		for {
+			conn, err := mock.listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if _, err := mock.readZabbixRequest(c); err != nil {
+					return
+				}
+				mock.writeZabbixResponse(c, successResp)
+			}(conn)
+		}
+	}()
+}
+
+// TestConcurrentSends verifies the Sender is safe for concurrent use:
+// parallel sends share the primary-host cache while it is concurrently
+// read, written, and cleared. Run with -race.
+func TestConcurrentSends(t *testing.T) {
+	live := newMockZabbixServer(t)
+	defer live.Close()
+	serveSuccessLoop(live)
+
+	dead := deadAddress(t)
+	s := NewSenderHosts([]string{dead, live.address})
+	s.ConnectTimeout = time.Second
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if n%5 == 0 {
+				s.SetPrimaryHost("") // concurrent cache invalidation
+			}
+			if _, err := sendTestPacket(s); err != nil {
+				errs <- err
+			}
+			_ = s.PrimaryHost() // concurrent cache read
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent send failed: %v", err)
+	}
+
+	if got := s.PrimaryHost(); got != live.address {
+		t.Errorf("PrimaryHost: expected %s, got %s", live.address, got)
 	}
 }
