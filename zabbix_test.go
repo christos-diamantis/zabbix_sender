@@ -1,6 +1,8 @@
 package zabbix_sender
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -52,26 +54,35 @@ func (m *mockZabbixServer) Close() {
 	m.listener.Close()
 }
 
-// readZabbixRequest reads and parses a Zabbix protocol request
+// readZabbixRequest reads and parses a Zabbix protocol request,
+// transparently decompressing compressed (flag 0x02) packets.
 func (m *mockZabbixServer) readZabbixRequest(conn net.Conn) (*ZabbixRequest, error) {
-	// Read protocol header (ZBXD) and version
-	header := make([]byte, 5)
+	// Read protocol header: "ZBXD" + flags + uint32 datalen + uint32 reserved
+	header := make([]byte, 13)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil, fmt.Errorf("failed to read header: %w", err)
 	}
-
-	// Read data length (8 bytes, little endian)
-	dataLengthRaw := make([]byte, 8)
-	if _, err := io.ReadFull(conn, dataLengthRaw); err != nil {
-		return nil, fmt.Errorf("failed to read data length: %w", err)
+	if string(header[:4]) != "ZBXD" {
+		return nil, fmt.Errorf("invalid protocol header: %q", header[:4])
 	}
-
-	dataLength := binary.LittleEndian.Uint64(dataLengthRaw)
+	flags := header[4]
+	dataLength := binary.LittleEndian.Uint32(header[5:9])
 
 	// Read data content
 	content := make([]byte, dataLength)
 	if _, err := io.ReadFull(conn, content); err != nil {
 		return nil, fmt.Errorf("failed to read content: %w", err)
+	}
+
+	if flags&0x02 != 0 {
+		zr, err := zlib.NewReader(bytes.NewReader(content))
+		if err != nil {
+			return nil, fmt.Errorf("failed to open compressed content: %w", err)
+		}
+		defer zr.Close()
+		if content, err = io.ReadAll(zr); err != nil {
+			return nil, fmt.Errorf("failed to decompress content: %w", err)
+		}
 	}
 
 	// Parse JSON request
