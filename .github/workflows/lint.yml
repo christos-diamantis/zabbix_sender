@@ -50,10 +50,9 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
           version: latest
-          args: --timeout=5m --build-tags=integration
 
   # Single required status check for branch protection.
   lint-passed:
