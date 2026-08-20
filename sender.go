@@ -31,6 +31,10 @@ const maxPacketSize = 1 << 30 // 1 GiB
 // only guards against a broken or malicious peer.
 const DefaultMaxResponseSize = 16 << 20 // 16 MiB
 
+// DefaultChunkSize is the number of metrics sent per packet when
+// Sender.ChunkSize is 0 (same default as python-zabbix-utils).
+const DefaultChunkSize = 250
+
 // Sender sends packets to a Zabbix server/proxy.
 //
 // A Sender is safe for concurrent use by multiple goroutines: sends run in
@@ -48,6 +52,12 @@ type Sender struct {
 	// MaxResponseSize caps the response body length the sender accepts.
 	// 0 means DefaultMaxResponseSize.
 	MaxResponseSize uint64
+
+	// ChunkSize splits packets with more than this many metrics into
+	// multiple sequential packets; the returned Response carries the
+	// summed statistics. 0 means DefaultChunkSize, negative disables
+	// chunking.
+	ChunkSize int
 
 	// TLSConfig enables certificate-based TLS (Zabbix TLSConnect=cert)
 	// when non-nil. Ignored when DialFunc is set.
@@ -155,6 +165,56 @@ func (s *Sender) Send(packet *Packet) (Response, error) {
 // SendContext is Send honoring the context's deadline and cancellation on
 // top of the Sender's own timeouts.
 func (s *Sender) SendContext(ctx context.Context, packet *Packet) (Response, error) {
+	chunkSize := s.ChunkSize
+	if chunkSize == 0 {
+		chunkSize = DefaultChunkSize
+	}
+	if chunkSize < 0 || len(packet.Data) <= chunkSize {
+		return s.sendPacket(ctx, packet)
+	}
+	return s.sendChunked(ctx, packet, chunkSize)
+}
+
+// sendChunked splits an oversized packet into chunks of chunkSize metrics,
+// sends them sequentially, and returns a synthesized success Response whose
+// info field carries the summed statistics of all chunks.
+func (s *Sender) sendChunked(ctx context.Context, packet *Packet, chunkSize int) (Response, error) {
+	numChunks := (len(packet.Data) + chunkSize - 1) / chunkSize
+	var total ResponseInfo
+
+	for i := 0; i < numChunks; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(packet.Data) {
+			end = len(packet.Data)
+		}
+
+		sub := *packet
+		sub.Data = packet.Data[start:end]
+
+		res, err := s.sendPacket(ctx, &sub)
+		if err != nil {
+			return res, fmt.Errorf("chunk %d/%d (%d metrics): %w", i+1, numChunks, end-start, err)
+		}
+		info, err := res.GetInfo()
+		if err != nil {
+			return res, fmt.Errorf("chunk %d/%d: parsing response info: %w", i+1, numChunks, err)
+		}
+		total.Processed += info.Processed
+		total.Failed += info.Failed
+		total.Total += info.Total
+		total.Spent += info.Spent
+	}
+
+	return Response{
+		Response: "success",
+		Info: fmt.Sprintf("processed: %d; failed: %d; total: %d; seconds spent: %.6f",
+			total.Processed, total.Failed, total.Total, total.Spent.Seconds()),
+	}, nil
+}
+
+// sendPacket sends one packet with redirect/HA handling.
+func (s *Sender) sendPacket(ctx context.Context, packet *Packet) (Response, error) {
 	primary := s.PrimaryHost()
 	if primary == "" && len(s.Hosts) == 0 {
 		return Response{}, errors.New("no hosts configured")
