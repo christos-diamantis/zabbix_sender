@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -23,15 +24,47 @@ const headerLen = 13
 // overflow) and is far beyond any real Zabbix payload.
 const maxPacketSize = 1 << 30 // 1 GiB
 
-// Sender struct.
+// Sender sends packets to a Zabbix server/proxy.
+//
+// A Sender is safe for concurrent use by multiple goroutines: sends run in
+// parallel, and the working-host cache is internally synchronized. The
+// configuration fields (Hosts, MaxRedirects, timeouts, ...) are read without
+// locking and must be set before the Sender is shared between goroutines.
 type Sender struct {
-	Hosts          []string // ordered list of proxies/servers; first successful cached in PrimaryHost
-	PrimaryHost    string   // cached working host (empty = try Hosts in order)
+	Hosts          []string // ordered list of proxies/servers; first successful cached as primary host
 	MaxRedirects   int      // max redirect attempts before error; default is 3
 	UpdateHost     bool     // if true, cache the final redirect target instead of the starting host
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
+
+	mu          sync.RWMutex
+	primaryHost string // cached working host (empty = try Hosts in order)
+}
+
+// PrimaryHost returns the cached working host (empty = none cached yet).
+func (s *Sender) PrimaryHost() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.primaryHost
+}
+
+// SetPrimaryHost pre-sets (or, with "", clears) the cached working host.
+func (s *Sender) SetPrimaryHost(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.primaryHost = host
+}
+
+// setPrimaryHostIf updates the cache only if it still holds expected, so a
+// concurrent send that already refreshed the cache is not overwritten with
+// stale information.
+func (s *Sender) setPrimaryHostIf(expected, host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.primaryHost == expected {
+		s.primaryHost = host
+	}
 }
 
 // ResponseError is returned when a server/proxy was reached and answered with
@@ -85,31 +118,33 @@ func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive e
 // only on transport errors; a host that answers (even with "failed") is
 // considered reachable and its answer final (see ResponseError).
 func (s *Sender) Send(packet *Packet) (Response, error) {
-	if s.PrimaryHost == "" && len(s.Hosts) == 0 {
+	primary := s.PrimaryHost()
+	if primary == "" && len(s.Hosts) == 0 {
 		return Response{}, errors.New("no hosts configured")
 	}
 
 	var lastErr error
 
-	if s.PrimaryHost != "" {
-		res, final, err := s.sendWithRedirects(packet, s.PrimaryHost)
+	if primary != "" {
+		res, final, err := s.sendWithRedirects(packet, primary)
 		if err == nil || isResponseError(err) {
 			if s.UpdateHost && final != "" {
-				s.PrimaryHost = final
+				s.setPrimaryHostIf(primary, final)
 			}
 			return res, err
 		}
 		lastErr = err
-		s.PrimaryHost = "" // clear cache, fall back to the host list
+		s.setPrimaryHostIf(primary, "") // clear cache, fall back to the host list
 	}
 
 	for _, host := range s.Hosts {
 		res, final, err := s.sendWithRedirects(packet, host)
 		if err == nil || isResponseError(err) {
-			s.PrimaryHost = host
+			cached := host
 			if s.UpdateHost && final != "" {
-				s.PrimaryHost = final
+				cached = final
 			}
+			s.SetPrimaryHost(cached)
 			return res, err
 		}
 		lastErr = err
