@@ -2,38 +2,49 @@ package zabbix_sender
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"time"
 )
 
+// zabbixHeader is the Zabbix protocol header: "ZBXD" + protocol flags (0x01).
+// https://www.zabbix.com/documentation/current/en/manual/appendix/protocols/header_datalen
+var zabbixHeader = []byte("ZBXD\x01")
+
+// headerLen is the full header size: "ZBXD" + flags byte + 8-byte data length.
+const headerLen = 13
+
 // Sender struct.
 type Sender struct {
 	Hosts          []string // ordered list of proxies/servers; first successful cached in PrimaryHost
-	PrimaryHost    string   // cached working host (empty = round-robin first)
-	MaxRedirects   int      // max redirect attempts bedore error; default is 3
-	UpdateHost     bool     // if true, update s.Host to final proxy after success
+	PrimaryHost    string   // cached working host (empty = try Hosts in order)
+	MaxRedirects   int      // max redirect attempts before error; default is 3
+	UpdateHost     bool     // if true, cache the final redirect target instead of the starting host
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 }
 
-// getHeader return zabbix header.
-// https://www.zabbix.com/documentation/4.0/manual/appendix/protocols/header_datalen
-func (s *Sender) getHeader() []byte {
-	return []byte("ZBXD\x01")
+// ResponseError is returned when a server/proxy was reached and answered with
+// a well-formed non-success response. It lets callers distinguish
+// application-level failures from transport errors; Send does not fail over
+// to another host when it occurs.
+type ResponseError struct {
+	Host string
+	Res  Response
 }
 
-// read data from connection.
-func (s *Sender) read(conn net.Conn) ([]byte, error) {
-	res, err := io.ReadAll(conn)
-	if err != nil {
-		return res, fmt.Errorf("receiving data: %s", err.Error())
-	}
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("host %s answered %q: %s", e.Host, e.Res.Response, e.Res.Info)
+}
 
-	return res, nil
+func isResponseError(err error) bool {
+	var respErr *ResponseError
+	return errors.As(err, &respErr)
 }
 
 // SendMetrics sends mixed active+trapper metrics.
@@ -52,7 +63,6 @@ func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive e
 	}
 
 	if len(trapperMetrics) > 0 {
-
 		packetTrapper := NewPacket(trapperMetrics, false)
 		resTrapper, errTrapper = s.Send(packetTrapper)
 	}
@@ -66,134 +76,154 @@ func (s *Sender) SendMetrics(metrics []*Metric) (resActive Response, errActive e
 }
 
 // Send sends single packet with redirect/HA handling.
-// Caches working PrimaryHost for future calls.
-func (s *Sender) Send(packet *Packet) (res Response, err error) {
-	if s.PrimaryHost != "" {
-		res, err = s.sendWithRedirects(packet, s.PrimaryHost)
-		if err == nil {
-			return res, nil
-		}
-		s.PrimaryHost = "" // clear cache
+// Caches working PrimaryHost for future calls. Fails over to the next host
+// only on transport errors; a host that answers (even with "failed") is
+// considered reachable and its answer final (see ResponseError).
+func (s *Sender) Send(packet *Packet) (Response, error) {
+	if s.PrimaryHost == "" && len(s.Hosts) == 0 {
+		return Response{}, errors.New("no hosts configured")
 	}
 
-	// Fallback: try each host in order
-	for _, host := range s.Hosts {
-		res, err = s.sendWithRedirects(packet, host)
-		if err == nil {
-			s.PrimaryHost = host // cache working host
-			return res, nil
+	var lastErr error
+
+	if s.PrimaryHost != "" {
+		res, final, err := s.sendWithRedirects(packet, s.PrimaryHost)
+		if err == nil || isResponseError(err) {
+			if s.UpdateHost && final != "" {
+				s.PrimaryHost = final
+			}
+			return res, err
 		}
+		lastErr = err
+		s.PrimaryHost = "" // clear cache, fall back to the host list
 	}
-	return res, fmt.Errorf("all %d hosts failed", len(s.Hosts))
+
+	for _, host := range s.Hosts {
+		res, final, err := s.sendWithRedirects(packet, host)
+		if err == nil || isResponseError(err) {
+			s.PrimaryHost = host
+			if s.UpdateHost && final != "" {
+				s.PrimaryHost = final
+			}
+			return res, err
+		}
+		lastErr = err
+	}
+
+	return Response{}, fmt.Errorf("all %d hosts failed: %w", len(s.Hosts), lastErr)
 }
 
-func (s *Sender) sendWithRedirects(packet *Packet, startHost string) (res Response, err error) {
-
+// sendWithRedirects follows proxy group redirects up to MaxRedirects and
+// returns the final host that answered.
+func (s *Sender) sendWithRedirects(packet *Packet, startHost string) (res Response, finalHost string, err error) {
 	currentHost := startHost
 
 	for redirectCount := 0; redirectCount <= s.MaxRedirects; redirectCount++ {
 		res, err = s.sendOnce(packet, currentHost)
 		if err != nil {
-			return res, fmt.Errorf("sendOnce to %s failed: %w", currentHost, err)
+			return res, currentHost, fmt.Errorf("sendOnce to %s failed: %w", currentHost, err)
 		}
 
 		// success - done
 		if res.Response == "success" {
-			return res, nil
+			return res, currentHost, nil
 		}
 
-		// check for redirect
+		// non-success without redirect: the server was reached and gave a final answer
 		if res.Redirect == nil || res.Redirect.Address == "" {
-			return res, fmt.Errorf("failed without redirect from %s: %s", currentHost, res.Response)
+			return res, currentHost, &ResponseError{Host: currentHost, Res: res}
 		}
 
 		// got redirect - update target and retry
-		newHost, err := parseHostPort(res.Redirect.Address)
-		if err != nil {
-			return res, err
+		newHost, perr := parseHostPort(res.Redirect.Address)
+		if perr != nil {
+			return res, currentHost, perr
 		}
 		currentHost = newHost
 	}
 
-	return res, fmt.Errorf("max redirects exceeded from %s", startHost)
+	return res, currentHost, fmt.Errorf("max redirects exceeded from %s", startHost)
 }
 
 func (s *Sender) sendOnce(packet *Packet, host string) (res Response, err error) {
 	// Timeout to resolve and connect to the server
 	conn, err := net.DialTimeout("tcp", host, s.ConnectTimeout)
 	if err != nil {
-		return res, fmt.Errorf("connecting to %s (timeout=%v): %v", host, s.ConnectTimeout, err)
+		return res, fmt.Errorf("connecting to %s (timeout=%v): %w", host, s.ConnectTimeout, err)
 	}
 	defer conn.Close()
 
-	dataPacket, _ := json.Marshal(packet)
+	body, err := json.Marshal(packet)
+	if err != nil {
+		return res, fmt.Errorf("marshaling packet: %w", err)
+	}
 
-	// Fill buffer
-	buffer := append(s.getHeader(), packet.DataLen()...)
-	buffer = append(buffer, dataPacket...)
+	buffer := make([]byte, 0, headerLen+len(body))
+	buffer = append(buffer, zabbixHeader...)
+	buffer = binary.LittleEndian.AppendUint64(buffer, uint64(len(body)))
+	buffer = append(buffer, body...)
 
 	// Write timeout
 	conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 
 	// Send packet to zabbix
 	if _, err = conn.Write(buffer); err != nil {
-		return res, fmt.Errorf("sending the data to %s (timeout=%v): %s", host, s.WriteTimeout, err.Error())
+		return res, fmt.Errorf("sending the data to %s (timeout=%v): %w", host, s.WriteTimeout, err)
 	}
 
-	// Read timeout
+	// Read timeout; the server closes the connection after answering
 	conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
-
-	// Read response from server
-	response, err := s.read(conn)
+	response, err := io.ReadAll(conn)
 	if err != nil {
-		return res, fmt.Errorf("reading the response from %s (timeout=%v): %s", host, s.ReadTimeout, err)
+		return res, fmt.Errorf("reading the response from %s (timeout=%v): %w", host, s.ReadTimeout, err)
 	}
 
-	if len(response) < 13 {
+	if len(response) < headerLen {
 		return res, fmt.Errorf("response too short from %s: %d bytes", host, len(response))
 	}
 
-	header := response[:5]
-	data := response[13:]
-
-	if !bytes.Equal(header, s.getHeader()) {
-		return res, fmt.Errorf("got no valid header [%+v] , expected [%+v]", header, s.getHeader())
+	if !bytes.Equal(response[:5], zabbixHeader) {
+		return res, fmt.Errorf("got no valid header [%+v], expected [%+v]", response[:5], zabbixHeader)
 	}
 
+	dataLen := binary.LittleEndian.Uint64(response[5:headerLen])
+	data := response[headerLen:]
+	if uint64(len(data)) < dataLen {
+		return res, fmt.Errorf("incomplete response from %s: header announces %d bytes, got %d", host, dataLen, len(data))
+	}
+	data = data[:dataLen]
+
 	if err := json.Unmarshal(data, &res); err != nil {
-		return res, fmt.Errorf("zabbix response from %s is not valid: %v", host, err)
+		return res, fmt.Errorf("zabbix response from %s is not valid: %w", host, err)
 	}
 
 	return res, nil
 }
 
 // RegisterHost sends host autoregistration request ("active checks").
-// Retries once as Zabbix requires 2 calls for confirmation.
+// A first "failed" answer is expected for unknown hosts (it is what triggers
+// the server-side autoregistration), so it retries once to confirm.
 func (s *Sender) RegisterHost(host, hostmetadata string) error {
-
-	p := &Packet{Request: "active checks", Host: host, HostMetadata: hostmetadata}
-
-	res, err := s.Send(p)
-	if err != nil {
-		return fmt.Errorf("sending packet: %v", err)
+	newPacket := func() *Packet {
+		return &Packet{Request: "active checks", Host: host, HostMetadata: hostmetadata}
 	}
 
-	if res.Response == "success" {
+	_, err := s.Send(newPacket())
+	if err == nil {
+		return nil // host already registered
+	}
+	if !isResponseError(err) {
+		return fmt.Errorf("sending packet: %w", err)
+	}
+
+	// The first call answered "failed", which triggers the autoregistration.
+	// Call again to verify the host is now registered.
+	_, err = s.Send(newPacket())
+	if err == nil {
 		return nil
 	}
-
-	// The autoregister process always return fail the first time
-	// We retry the process to get success response to verify the host registration properly
-	p = &Packet{Request: "active checks", Host: host, HostMetadata: hostmetadata}
-
-	res, err = s.Send(p)
-	if err != nil {
-		return fmt.Errorf("sending packet: %v", err)
+	if isResponseError(err) {
+		return fmt.Errorf("autoregistration failed, verify hostmetadata: %w", err)
 	}
-
-	if res.Response == "failed" {
-		return fmt.Errorf("autoregistration failed, verify hostmetadata")
-	}
-
-	return nil
+	return fmt.Errorf("sending packet: %w", err)
 }

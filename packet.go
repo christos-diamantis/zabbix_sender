@@ -37,6 +37,6 @@ func NewPacket(data []*Metric, agentActive bool, t ...time.Time) *Packet {
 func (p *Packet) DataLen() []byte {
 	dataLen := make([]byte, 8)
 	JSONData, _ := json.Marshal(p)
-	binary.LittleEndian.PutUint32(dataLen, uint32(len(JSONData)))
+	binary.LittleEndian.PutUint64(dataLen, uint64(len(JSONData)))
 	return dataLen
 }

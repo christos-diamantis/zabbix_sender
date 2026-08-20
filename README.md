@@ -1,7 +1,7 @@
 # zabbix-sender
 
 Golang package, implementing zabbix sender protocol for sending metrics to zabbix. 
-Supports modern Zabbix 7.0+ proxy group redirect and multi-host high vailability.
+Supports modern Zabbix 7.0+ proxy group redirect and multi-host high availability.
 
 ## ✨ Features
 - Send data on single host (Zabbix server or Proxy)
@@ -25,6 +25,7 @@ package main
 
 import (
     "fmt"
+    "time"
 
     "github.com/christos-diamantis/zabbix_sender"
 )
@@ -150,7 +151,7 @@ sender.PrimaryHost = "known-good-proxy:10051" // pre-set cached host
 
 - **Zabbix:** 4.0+ (redirects: 7.0+)
 
-- Go: 1.21+
+- Go: 1.20+
 
 ## 🙏 Credits
 Forked & enhanced from **chmller/go-zabbix-sender**.
